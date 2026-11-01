@@ -1,0 +1,117 @@
+# Made by AppForShare (https://appforshare.io/docs/github-builds). Builds the Android app on this repository's
+# GitHub Actions minutes and sends the .apk to AppForShare, where testers install it from a link.
+# You can edit this file. AppForShare only starts it and reads its runs.
+name: AppForShare Android build (apk test)
+run-name: "AppForShare build ${{ inputs.afs_run || github.sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      afs_run:
+        description: Set by AppForShare to match the run
+        required: false
+        default: ''
+      release_notes:
+        description: Release notes for testers
+        required: false
+        default: ''
+      channel:
+        description: AppForShare channel (beta, live)
+        required: false
+        default: ''
+      build_number:
+        description: Version code for this run (empty = the setup's choice)
+        required: false
+        default: ''
+
+concurrency:
+  group: appforshare-android-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup
+        run: |
+          echo setup ran
+
+      - name: Upload keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.APPFORSHARE_ANDROID_KEYSTORE }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then echo "::error::Add the APPFORSHARE_ANDROID_KEYSTORE secret (base64 of your upload keystore), APPFORSHARE_ANDROID_KEYSTORE_PASSWORD, APPFORSHARE_ANDROID_KEY_ALIAS and APPFORSHARE_ANDROID_KEY_PASSWORD."; exit 1; fi
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/afs-upload.keystore"
+          chmod 600 "$RUNNER_TEMP/afs-upload.keystore"
+
+      - name: Build .apk
+        id: build
+        env:
+          AFS_INPUT_NUMBER: ${{ inputs.build_number }}
+          AFS_VERSION_NAME: '2.3.4'
+          KS_PASSWORD: ${{ secrets.APPFORSHARE_ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.APPFORSHARE_ANDROID_KEY_ALIAS }}
+          KS_KEY_PASSWORD: ${{ secrets.APPFORSHARE_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          AFS_BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          if [ -n "$AFS_INPUT_NUMBER" ]; then AFS_BUILD_NUMBER="$AFS_INPUT_NUMBER"; fi
+          if [ -n "$AFS_BUILD_NUMBER" ] && { ! [[ "$AFS_BUILD_NUMBER" =~ ^[0-9]{1,10}$ ]] || [ "$AFS_BUILD_NUMBER" -lt 1 ] || [ "$AFS_BUILD_NUMBER" -gt 2100000000 ]; }; then echo "::error::Version code $AFS_BUILD_NUMBER must be a whole number from 1 to 2100000000."; exit 1; fi
+          export AFS_BUILD_NUMBER
+          [ -n "$AFS_BUILD_NUMBER" ] && echo "Version code $AFS_BUILD_NUMBER" >> "$GITHUB_STEP_SUMMARY"
+          cat > "$RUNNER_TEMP/afs-version.gradle" <<'GRADLE'
+          def afsCode = System.getenv('AFS_BUILD_NUMBER') ?: ''
+          def afsName = System.getenv('AFS_VERSION_NAME') ?: ''
+          if (afsCode || afsName) {
+            allprojects { p ->
+              p.plugins.withId('com.android.application') {
+                def ac = p.extensions.getByName('androidComponents')
+                ac.onVariants(ac.selector().all(), { v ->
+                  v.outputs.each { o ->
+                    if (afsCode) o.versionCode.set(afsCode as Integer)
+                    if (afsName) o.versionName.set(afsName)
+                  }
+                })
+              }
+            }
+          }
+          GRADLE
+          AFS_SIGN=(
+            "-Pandroid.injected.signing.store.file=$RUNNER_TEMP/afs-upload.keystore"
+            "-Pandroid.injected.signing.store.password=$KS_PASSWORD"
+            "-Pandroid.injected.signing.key.alias=$KS_ALIAS"
+            "-Pandroid.injected.signing.key.password=${KS_KEY_PASSWORD:-$KS_PASSWORD}"
+          )
+          cd 'android'
+          chmod +x ./gradlew
+          ./gradlew :app:assembleProdRelease --init-script "$RUNNER_TEMP/afs-version.gradle" "${AFS_SIGN[@]}" --no-daemon
+          cd "$GITHUB_WORKSPACE"
+          FILE=$(find 'android/app/build/outputs/apk' -name '*.apk' ! -name '*unsigned*' -newer "$RUNNER_TEMP/afs-version.gradle" | head -n 1)
+          if [ -z "$FILE" ]; then echo "::error::No signed .apk found under android/app/build/outputs. Check the signing setup."; exit 1; fi
+          echo "Built $FILE"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Verify (test only)
+        env:
+          AFS_FILE: ${{ steps.build.outputs.file }}
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          echo "file $AFS_FILE"
+          "$BT/aapt2" dump badging "$AFS_FILE" | head -n 1; "$BT/apksigner" verify --print-certs "$AFS_FILE" | head -n 3
+
+      - name: Remove the keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/afs-upload.keystore"
